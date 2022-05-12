@@ -1,4 +1,3 @@
-from __future__ import unicode_literals
 import json
 
 
@@ -245,10 +244,6 @@ class VrtNUIE(GigyaBaseIE):
             'upload_date': '20200727',
         },
         'skip': 'This video is only available for registered users',
-        'params': {
-            'username': '<snip>',
-            'password': '<snip>',
-        },
         'expected_warnings': ['is not a supported codec'],
     }, {
         # Only available via new API endpoint
@@ -264,10 +259,6 @@ class VrtNUIE(GigyaBaseIE):
             'episode_number': 5,
         },
         'skip': 'This video is only available for registered users',
-        'params': {
-            'username': '<snip>',
-            'password': '<snip>',
-        },
         'expected_warnings': ['Unable to download asset JSON', 'is not a supported codec', 'Unknown MIME type'],
     }]
     _NETRC_MACHINE = 'vrtnu'

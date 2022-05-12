@@ -1,6 +1,3 @@
-# coding: utf-8
-from __future__ import unicode_literals
-
 import random
 import re
 import string
@@ -245,6 +242,9 @@ class FunimationIE(FunimationBaseIE):
                         'language_preference': language_preference(lang.lower()),
                     })
                 formats.extend(current_formats)
+        if not formats and (requested_languages or requested_versions):
+            self.raise_no_formats(
+                'There are no video formats matching the requested languages/versions', expected=True, video_id=display_id)
         self._remove_duplicate_formats(formats)
         self._sort_formats(formats, ('lang', 'source'))
 
@@ -333,7 +333,7 @@ class FunimationShowIE(FunimationBaseIE):
             'https://prod-api-funimationnow.dadcdigital.com/api/funimation/episodes/?limit=99999&title_id=%s'
             % show_info.get('id'), display_id)
 
-        vod_items = traverse_obj(items_info, ('items', ..., re.compile('(?i)mostRecent[AS]vod').match, 'item'))
+        vod_items = traverse_obj(items_info, ('items', ..., lambda k, _: re.match(r'(?i)mostRecent[AS]vod', k), 'item'))
 
         return {
             '_type': 'playlist',

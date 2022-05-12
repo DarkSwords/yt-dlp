@@ -1,7 +1,4 @@
-# coding: utf-8
-
-from __future__ import unicode_literals
-
+import base64
 import calendar
 import copy
 import datetime
@@ -14,9 +11,9 @@ import os.path
 import random
 import re
 import sys
+import threading
 import time
 import traceback
-import threading
 
 from .common import InfoExtractor, SearchInfoExtractor
 from ..compat import (
@@ -31,12 +28,13 @@ from ..compat import (
 )
 from ..jsinterp import JSInterpreter
 from ..utils import (
+    NO_DEFAULT,
+    ExtractorError,
     bug_reports_message,
     clean_html,
     datetime_from_str,
     dict_get,
     error_to_compat_str,
-    ExtractorError,
     float_or_none,
     format_field,
     get_first,
@@ -46,7 +44,6 @@ from ..utils import (
     js_to_json,
     mimetype2ext,
     network_exceptions,
-    NO_DEFAULT,
     orderedSet,
     parse_codecs,
     parse_count,
@@ -71,7 +68,6 @@ from ..utils import (
     urljoin,
     variadic,
 )
-
 
 # any clients starting with _ cannot be explicity requested by the user
 INNERTUBE_CLIENTS = {
@@ -217,15 +213,35 @@ INNERTUBE_CLIENTS = {
             }
         },
         'INNERTUBE_CONTEXT_CLIENT_NAME': 2
-    }
+    },
+    # This client can access age restricted videos (unless the uploader has disabled the 'allow embedding' option)
+    # See: https://github.com/zerodytrash/YouTube-Internal-Clients
+    'tv_embedded': {
+        'INNERTUBE_API_KEY': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+        'INNERTUBE_CONTEXT': {
+            'client': {
+                'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+                'clientVersion': '2.0',
+            },
+        },
+        'INNERTUBE_CONTEXT_CLIENT_NAME': 85
+    },
 }
+
+
+def _split_innertube_client(client_name):
+    variant, *base = client_name.rsplit('.', 1)
+    if base:
+        return variant, base[0], variant
+    base, *variant = client_name.split('_', 1)
+    return client_name, base, variant[0] if variant else None
 
 
 def build_innertube_clients():
     THIRD_PARTY = {
-        'embedUrl': 'https://google.com',  # Can be any valid URL
+        'embedUrl': 'https://www.youtube.com/',  # Can be any valid URL
     }
-    BASE_CLIENTS = ('android', 'web', 'ios', 'mweb')
+    BASE_CLIENTS = ('android', 'web', 'tv', 'ios', 'mweb')
     priority = qualities(BASE_CLIENTS[::-1])
 
     for client, ytcfg in tuple(INNERTUBE_CLIENTS.items()):
@@ -234,15 +250,15 @@ def build_innertube_clients():
         ytcfg.setdefault('REQUIRE_JS_PLAYER', True)
         ytcfg['INNERTUBE_CONTEXT']['client'].setdefault('hl', 'en')
 
-        base_client, *variant = client.split('_')
+        _, base_client, variant = _split_innertube_client(client)
         ytcfg['priority'] = 10 * priority(base_client)
 
         if not variant:
-            INNERTUBE_CLIENTS[f'{client}_agegate'] = agegate_ytcfg = copy.deepcopy(ytcfg)
-            agegate_ytcfg['INNERTUBE_CONTEXT']['client']['clientScreen'] = 'EMBED'
-            agegate_ytcfg['INNERTUBE_CONTEXT']['thirdParty'] = THIRD_PARTY
-            agegate_ytcfg['priority'] -= 1
-        elif variant == ['embedded']:
+            INNERTUBE_CLIENTS[f'{client}_embedscreen'] = embedscreen = copy.deepcopy(ytcfg)
+            embedscreen['INNERTUBE_CONTEXT']['client']['clientScreen'] = 'EMBED'
+            embedscreen['INNERTUBE_CONTEXT']['thirdParty'] = THIRD_PARTY
+            embedscreen['priority'] -= 3
+        elif variant == 'embedded':
             ytcfg['INNERTUBE_CONTEXT']['thirdParty'] = THIRD_PARTY
             ytcfg['priority'] -= 2
         else:
@@ -272,7 +288,7 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
         # invidious-redirect websites
         r'(?:www\.)?redirect\.invidious\.io',
         r'(?:(?:www|dev)\.)?invidio\.us',
-        # Invidious instances taken from https://github.com/iv-org/documentation/blob/master/Invidious-Instances.md
+        # Invidious instances taken from https://github.com/iv-org/documentation/blob/master/docs/instances.md
         r'(?:www\.)?invidious\.pussthecat\.org',
         r'(?:www\.)?invidious\.zee\.li',
         r'(?:www\.)?invidious\.ethibox\.fr',
@@ -364,6 +380,9 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
     def _real_initialize(self):
         self._initialize_pref()
         self._initialize_consent()
+        self._check_login_required()
+
+    def _check_login_required(self):
         if (self._LOGIN_REQUIRED
                 and self.get_param('cookiefile') is None
                 and self.get_param('cookiesfrombrowser') is None):
@@ -429,7 +448,7 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
             return None
         # SAPISIDHASH algorithm from https://stackoverflow.com/a/32065323
         sapisidhash = hashlib.sha1(
-            f'{time_now} {self._SAPISID} {origin}'.encode('utf-8')).hexdigest()
+            f'{time_now} {self._SAPISID} {origin}'.encode()).hexdigest()
         return f'SAPISIDHASH {time_now}_{sapisidhash}'
 
     def _call_api(self, ep, query, video_id, fatal=True, headers=None,
@@ -443,14 +462,14 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
         if headers:
             real_headers.update(headers)
         return self._download_json(
-            'https://%s/youtubei/v1/%s' % (api_hostname or self._get_innertube_host(default_client), ep),
+            f'https://{api_hostname or self._get_innertube_host(default_client)}/youtubei/v1/{ep}',
             video_id=video_id, fatal=fatal, note=note, errnote=errnote,
             data=json.dumps(data).encode('utf8'), headers=real_headers,
             query={'key': api_key or self._extract_api_key(), 'prettyPrint': 'false'})
 
     def extract_yt_initial_data(self, item_id, webpage, fatal=True):
         data = self._search_regex(
-            (r'%s\s*%s' % (self._YT_INITIAL_DATA_RE, self._YT_INITIAL_BOUNDARY_RE),
+            (fr'{self._YT_INITIAL_DATA_RE}\s*{self._YT_INITIAL_BOUNDARY_RE}',
              self._YT_INITIAL_DATA_RE), webpage, 'yt initial data', fatal=fatal)
         if data:
             return self._parse_json(data, item_id, fatal=fatal)
@@ -543,6 +562,18 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
             headers['X-Origin'] = origin
         return {h: v for h, v in headers.items() if v is not None}
 
+    def _download_ytcfg(self, client, video_id):
+        url = {
+            'web': 'https://www.youtube.com',
+            'web_music': 'https://music.youtube.com',
+            'web_embedded': f'https://www.youtube.com/embed/{video_id}?html5=1'
+        }.get(client)
+        if not url:
+            return {}
+        webpage = self._download_webpage(
+            url, video_id, fatal=False, note=f'Downloading {client.replace("_", " ").strip()} client config')
+        return self.extract_ytcfg(video_id, webpage) or {}
+
     @staticmethod
     def _build_api_continuation_query(continuation, ctp=None):
         query = {
@@ -622,7 +653,7 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
                 warnings.append([alert_type, alert_message])
 
         for alert_type, alert_message in (warnings + errors[:-1]):
-            self.report_warning('YouTube said: %s - %s' % (alert_type, alert_message), only_once=only_once)
+            self.report_warning(f'YouTube said: {alert_type} - {alert_message}', only_once=only_once)
         if errors:
             raise ExtractorError('YouTube said: %s' % errors[-1][1], expected=expected)
 
@@ -708,6 +739,7 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
                 return None
 
     def _extract_time_text(self, renderer, *path_list):
+        """@returns (timestamp, time_text)"""
         text = self._get_text(renderer, *path_list) or ''
         dt = self.extract_relative_time(text)
         timestamp = None
@@ -807,23 +839,37 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
         description = self._get_text(renderer, 'descriptionSnippet')
         duration = parse_duration(self._get_text(
             renderer, 'lengthText', ('thumbnailOverlays', ..., 'thumbnailOverlayTimeStatusRenderer', 'text')))
+        if duration is None:
+            duration = parse_duration(self._search_regex(
+                r'(?i)(ago)(?!.*\1)\s+(?P<duration>[a-z0-9 ,]+?)(?:\s+[\d,]+\s+views)?(?:\s+-\s+play\s+short)?$',
+                traverse_obj(renderer, ('title', 'accessibility', 'accessibilityData', 'label'), default='', expected_type=str),
+                video_id, default=None, group='duration'))
+
         view_count = self._get_count(renderer, 'viewCountText')
 
         uploader = self._get_text(renderer, 'ownerText', 'shortBylineText')
         channel_id = traverse_obj(
-            renderer, ('shortBylineText', 'runs', ..., 'navigationEndpoint', 'browseEndpoint', 'browseId'), expected_type=str, get_all=False)
+            renderer, ('shortBylineText', 'runs', ..., 'navigationEndpoint', 'browseEndpoint', 'browseId'),
+            expected_type=str, get_all=False)
         timestamp, time_text = self._extract_time_text(renderer, 'publishedTimeText')
         scheduled_timestamp = str_to_int(traverse_obj(renderer, ('upcomingEventData', 'startTime'), get_all=False))
         overlay_style = traverse_obj(
-            renderer, ('thumbnailOverlays', ..., 'thumbnailOverlayTimeStatusRenderer', 'style'), get_all=False, expected_type=str)
+            renderer, ('thumbnailOverlays', ..., 'thumbnailOverlayTimeStatusRenderer', 'style'),
+            get_all=False, expected_type=str)
         badges = self._extract_badges(renderer)
         thumbnails = self._extract_thumbnails(renderer, 'thumbnail')
+        navigation_url = urljoin('https://www.youtube.com/', traverse_obj(
+            renderer, ('navigationEndpoint', 'commandMetadata', 'webCommandMetadata', 'url'),
+            expected_type=str)) or ''
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        if overlay_style == 'SHORTS' or '/shorts/' in navigation_url:
+            url = f'https://www.youtube.com/shorts/{video_id}'
 
         return {
             '_type': 'url',
             'ie_key': YoutubeIE.ie_key(),
             'id': video_id,
-            'url': f'https://www.youtube.com/watch?v={video_id}',
+            'url': url,
             'title': title,
             'description': description,
             'duration': duration,
@@ -831,7 +877,9 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
             'uploader': uploader,
             'channel_id': channel_id,
             'thumbnails': thumbnails,
-            'upload_date': strftime_or_none(timestamp, '%Y%m%d') if self._configuration_arg('approximate_date', ie_key='youtubetab') else None,
+            'upload_date': (strftime_or_none(timestamp, '%Y%m%d')
+                            if self._configuration_arg('approximate_date', ie_key='youtubetab')
+                            else None),
             'live_status': ('is_upcoming' if scheduled_timestamp is not None
                             else 'was_live' if 'streamed' in time_text.lower()
                             else 'is_live' if overlay_style is not None and overlay_style == 'LIVE' or 'live now' in badges
@@ -2152,7 +2200,33 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 'description': 'md5:2ef1d002cad520f65825346e2084e49d',
             },
             'params': {'skip_download': True}
-        },
+        }, {
+            # Story. Requires specific player params to work.
+            # Note: stories get removed after some period of time
+            'url': 'https://www.youtube.com/watch?v=yN3x1t3sieA',
+            'info_dict': {
+                'id': 'yN3x1t3sieA',
+                'ext': 'mp4',
+                'uploader': 'Linus Tech Tips',
+                'duration': 13,
+                'channel': 'Linus Tech Tips',
+                'playable_in_embed': True,
+                'tags': [],
+                'age_limit': 0,
+                'uploader_url': 'http://www.youtube.com/user/LinusTechTips',
+                'upload_date': '20220402',
+                'thumbnail': 'https://i.ytimg.com/vi_webp/yN3x1t3sieA/maxresdefault.webp',
+                'title': 'Story',
+                'live_status': 'not_live',
+                'uploader_id': 'LinusTechTips',
+                'view_count': int,
+                'description': '',
+                'channel_id': 'UCXuqSBlHAE6Xw-yeJA0Tunw',
+                'categories': ['Science & Technology'],
+                'channel_url': 'https://www.youtube.com/channel/UCXuqSBlHAE6Xw-yeJA0Tunw',
+                'availability': 'unlisted',
+            }
+        }
     ]
 
     @classmethod
@@ -2162,10 +2236,10 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         qs = parse_qs(url)
         if qs.get('list', [None])[0]:
             return False
-        return super(YoutubeIE, cls).suitable(url)
+        return super().suitable(url)
 
     def __init__(self, *args, **kwargs):
-        super(YoutubeIE, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._code_cache = {}
         self._player_cache = {}
 
@@ -2361,8 +2435,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         player_id = self._extract_player_info(player_url)
 
         # Read from filesystem cache
-        func_id = 'js_%s_%s' % (
-            player_id, self._signature_cache_id(example_sig))
+        func_id = f'js_{player_id}_{self._signature_cache_id(example_sig)}'
         assert os.path.basename(func_id) == func_id
 
         cache_spec = self._downloader.cache.load('youtube-sigfuncs', func_id)
@@ -2389,7 +2462,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 starts = '' if start == 0 else str(start)
                 ends = (':%d' % (end + step)) if end + step >= 0 else ':'
                 steps = '' if step == 1 else (':%d' % step)
-                return 's[%s%s%s]' % (starts, ends, steps)
+                return f's[{starts}{ends}{steps}]'
 
             step = None
             # Quelch pyflakes warnings - start will be set when step is set
@@ -2551,7 +2624,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         # cpn generation algorithm is reverse engineered from base.js.
         # In fact it works even with dummy cpn.
         CPN_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_'
-        cpn = ''.join((CPN_ALPHABET[random.randint(0, 256) & 63] for _ in range(0, 16)))
+        cpn = ''.join(CPN_ALPHABET[random.randint(0, 256) & 63] for _ in range(0, 16))
 
         qs.update({
             'ver': ['2'],
@@ -2662,7 +2735,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
 
     def _extract_yt_initial_variable(self, webpage, regex, video_id, name):
         return self._parse_json(self._search_regex(
-            (r'%s\s*%s' % (regex, self._YT_INITIAL_BOUNDARY_RE),
+            (fr'{regex}\s*{self._YT_INITIAL_BOUNDARY_RE}',
              regex), webpage, name, default='{}'), video_id, fatal=False)
 
     def _extract_comment(self, comment_renderer, parent=None):
@@ -2760,8 +2833,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     comment_entries_iter = self._comment_entries(
                         comment_replies_renderer, ytcfg, video_id,
                         parent=comment.get('id'), tracker=tracker)
-                    for reply_comment in itertools.islice(comment_entries_iter, min(max_replies_per_thread, max(0, max_replies - tracker['total_reply_comments']))):
-                        yield reply_comment
+                    yield from itertools.islice(comment_entries_iter, min(
+                        max_replies_per_thread, max(0, max_replies - tracker['total_reply_comments'])))
 
         # Keeps track of counts across recursive calls
         if not tracker:
@@ -2785,12 +2858,17 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             lambda p: int_or_none(p, default=sys.maxsize), self._configuration_arg('max_comments', ) + [''] * 4)
 
         continuation = self._extract_continuation(root_continuation_data)
-        message = self._get_text(root_continuation_data, ('contents', ..., 'messageRenderer', 'text'), max_runs=1)
-        if message and not parent:
-            self.report_warning(message, video_id=video_id)
 
         response = None
+        is_forced_continuation = False
         is_first_continuation = parent is None
+        if is_first_continuation and not continuation:
+            # Sometimes you can get comments by generating the continuation yourself,
+            # even if YouTube initially reports them being disabled - e.g. stories comments.
+            # Note: if the comment section is actually disabled, YouTube may return a response with
+            # required check_get_keys missing. So we will disable that check initially in this case.
+            continuation = self._build_api_continuation_query(self._generate_comment_continuation(video_id))
+            is_forced_continuation = True
 
         for page_num in itertools.count(0):
             if not continuation:
@@ -2811,8 +2889,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             response = self._extract_response(
                 item_id=None, query=continuation,
                 ep='next', ytcfg=ytcfg, headers=headers, note=note_prefix,
-                check_get_keys='onResponseReceivedEndpoints')
-
+                check_get_keys='onResponseReceivedEndpoints' if not is_forced_continuation else None)
+            is_forced_continuation = False
             continuation_contents = traverse_obj(
                 response, 'onResponseReceivedEndpoints', expected_type=list, default=[])
 
@@ -2836,6 +2914,18 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 continuation = self._extract_continuation({'contents': continuation_items})
                 if continuation:
                     break
+
+        message = self._get_text(root_continuation_data, ('contents', ..., 'messageRenderer', 'text'), max_runs=1)
+        if message and not parent and tracker['running_total'] == 0:
+            self.report_warning(f'Youtube said: {message}', video_id=video_id, only_once=True)
+
+    @staticmethod
+    def _generate_comment_continuation(video_id):
+        """
+        Generates initial comment section continuation token from given video id
+        """
+        token = f'\x12\r\x12\x0b{video_id}\x18\x062\'"\x11"\x0b{video_id}0\x00x\x020\x00B\x10comments-section'
+        return base64.b64encode(token.encode()).decode()
 
     def _get_comments(self, ytcfg, video_id, contents, webpage):
         """Entry for comment extraction"""
@@ -2890,7 +2980,10 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         headers = self.generate_api_headers(
             ytcfg=player_ytcfg, account_syncid=syncid, session_index=session_index, default_client=client)
 
-        yt_query = {'videoId': video_id}
+        yt_query = {
+            'videoId': video_id,
+            'params': '8AEB'  # enable stories
+        }
         yt_query.update(self._generate_player_context(sts))
         return self._extract_response(
             item_id=video_id, ep='player', query=yt_query,
@@ -2903,7 +2996,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         requested_clients = []
         default = ['android', 'web']
         allowed_clients = sorted(
-            [client for client in INNERTUBE_CLIENTS.keys() if client[:1] != '_'],
+            (client for client in INNERTUBE_CLIENTS.keys() if client[:1] != '_'),
             key=lambda client: INNERTUBE_CLIENTS[client]['priority'], reverse=True)
         for client in self._configuration_arg('player_client'):
             if client in allowed_clients:
@@ -2923,16 +3016,6 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
 
         return orderedSet(requested_clients)
 
-    def _extract_player_ytcfg(self, client, video_id):
-        url = {
-            'web_music': 'https://music.youtube.com',
-            'web_embedded': f'https://www.youtube.com/embed/{video_id}?html5=1'
-        }.get(client)
-        if not url:
-            return {}
-        webpage = self._download_webpage(url, video_id, fatal=False, note='Downloading %s config' % client.replace('_', ' ').strip())
-        return self.extract_ytcfg(video_id, webpage) or {}
-
     def _extract_player_responses(self, clients, video_id, webpage, master_ytcfg):
         initial_pr = None
         if webpage:
@@ -2940,13 +3023,19 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 webpage, self._YT_INITIAL_PLAYER_RESPONSE_RE,
                 video_id, 'initial player response')
 
-        original_clients = clients
+        all_clients = set(clients)
         clients = clients[::-1]
         prs = []
 
-        def append_client(client_name):
-            if client_name in INNERTUBE_CLIENTS and client_name not in original_clients:
-                clients.append(client_name)
+        def append_client(*client_names):
+            """ Append the first client name that exists but not already used """
+            for client_name in client_names:
+                actual_client = _split_innertube_client(client_name)[0]
+                if actual_client in INNERTUBE_CLIENTS:
+                    if actual_client not in all_clients:
+                        clients.append(client_name)
+                        all_clients.add(actual_client)
+                        return
 
         # Android player_response does not have microFormats which are needed for
         # extraction of some data. So we return the initial_pr with formats
@@ -2961,10 +3050,10 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         tried_iframe_fallback = False
         player_url = None
         while clients:
-            client = clients.pop()
+            client, base_client, variant = _split_innertube_client(clients.pop())
             player_ytcfg = master_ytcfg if client == 'web' else {}
-            if 'configs' not in self._configuration_arg('player_skip'):
-                player_ytcfg = self._extract_player_ytcfg(client, video_id) or player_ytcfg
+            if 'configs' not in self._configuration_arg('player_skip') and client != 'web':
+                player_ytcfg = self._download_ytcfg(client, video_id) or player_ytcfg
 
             player_url = player_url or self._extract_player_url(master_ytcfg, player_ytcfg, webpage=webpage)
             require_js_player = self._get_default_ytcfg(client).get('REQUIRE_JS_PLAYER')
@@ -2989,10 +3078,13 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 prs.append(pr)
 
             # creator clients can bypass AGE_VERIFICATION_REQUIRED if logged in
-            if client.endswith('_agegate') and self._is_unplayable(pr) and self.is_authenticated:
-                append_client(client.replace('_agegate', '_creator'))
+            if variant == 'embedded' and self._is_unplayable(pr) and self.is_authenticated:
+                append_client(f'{base_client}_creator')
             elif self._is_agegated(pr):
-                append_client(f'{client}_agegate')
+                if variant == 'tv_embedded':
+                    append_client(f'{base_client}_embedded')
+                elif not variant:
+                    append_client(f'tv_embedded.{base_client}', f'{base_client}_embedded')
 
         if last_error:
             if not len(prs):
@@ -3013,7 +3105,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         streaming_formats = traverse_obj(streaming_data, (..., ('formats', 'adaptiveFormats'), ...), default=[])
 
         for fmt in streaming_formats:
-            if fmt.get('targetDurationSec') or fmt.get('drmFamilies'):
+            if fmt.get('targetDurationSec'):
                 continue
 
             itag = str_or_none(fmt.get('itag'))
@@ -3062,7 +3154,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                         'n': self._decrypt_nsig(query['n'][0], video_id, player_url)})
                 except ExtractorError as e:
                     self.report_warning(
-                        f'nsig extraction failed: You may experience throttling for some formats\n'
+                        'nsig extraction failed: You may experience throttling for some formats\n'
                         f'n = {query["n"][0]} ; player = {player_url}\n{e}', only_once=True)
                     throttled = True
 
@@ -3081,7 +3173,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             # Eg: __2ABJjxzNo, ySuUZEjARPY
             is_damaged = try_get(fmt, lambda x: float(x['approxDurationMs']) / duration < 500)
             if is_damaged:
-                self.report_warning(f'{video_id}: Some formats are possibly damaged. They will be deprioritized', only_once=True)
+                self.report_warning(
+                    f'{video_id}: Some formats are possibly damaged. They will be deprioritized', only_once=True)
             dct = {
                 'asr': int_or_none(fmt.get('audioSampleRate')),
                 'filesize': int_or_none(fmt.get('contentLength')),
@@ -3091,10 +3184,12 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                               ' (default)' if language_preference > 0 else ''),
                     fmt.get('qualityLabel') or quality.replace('audio_quality_', ''),
                     throttled and 'THROTTLED', is_damaged and 'DAMAGED', delim=', '),
-                'source_preference': -10 if throttled else -1,
+                # Format 22 is likely to be damaged. See https://github.com/yt-dlp/yt-dlp/issues/3372
+                'source_preference': -10 if throttled else -5 if itag == '22' else -1,
                 'fps': int_or_none(fmt.get('fps')) or None,
                 'height': height,
                 'quality': q(quality),
+                'has_drm': bool(fmt.get('drmFamilies')),
                 'tbr': tbr,
                 'url': fmt_url,
                 'width': int_or_none(fmt.get('width')),
@@ -3128,6 +3223,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         skip_manifests = self._configuration_arg('skip')
         if not self.get_param('youtube_include_hls_manifest', True):
             skip_manifests.append('hls')
+        if not self.get_param('youtube_include_dash_manifest', True):
+            skip_manifests.append('dash')
         get_dash = 'dash' not in skip_manifests and (
             not is_live or live_from_start or self._configuration_arg('include_live_dash'))
         get_hls = not live_from_start and 'hls' not in skip_manifests
@@ -3205,7 +3302,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         webpage = None
         if 'webpage' not in self._configuration_arg('player_skip'):
             webpage = self._download_webpage(
-                webpage_url + '&bpctr=9999999999&has_verified=1', video_id, fatal=False)
+                webpage_url + '&bpctr=9999999999&has_verified=1&pp=8AEB', video_id, fatal=False)
 
         master_ytcfg = self.extract_ytcfg(video_id, webpage) or self._get_default_ytcfg()
 
@@ -3356,13 +3453,13 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         original_thumbnails = thumbnails.copy()
 
         # The best resolution thumbnails sometimes does not appear in the webpage
-        # See: https://github.com/ytdl-org/youtube-dl/issues/29049, https://github.com/yt-dlp/yt-dlp/issues/340
+        # See: https://github.com/yt-dlp/yt-dlp/issues/340
         # List of possible thumbnails - Ref: <https://stackoverflow.com/a/20542029>
         thumbnail_names = [
-            'maxresdefault', 'hq720', 'sddefault', 'sd1', 'sd2', 'sd3',
-            'hqdefault', 'hq1', 'hq2', 'hq3', '0',
-            'mqdefault', 'mq1', 'mq2', 'mq3',
-            'default', '1', '2', '3'
+            # While the *1,*2,*3 thumbnails are just below their correspnding "*default" variants
+            # in resolution, these are not the custom thumbnail. So de-prioritize them
+            'maxresdefault', 'hq720', 'sddefault', 'hqdefault', '0', 'mqdefault', 'default',
+            'sd1', 'sd2', 'sd3', 'hq1', 'hq2', 'hq3', 'mq1', 'mq2', 'mq3', '1', '2', '3'
         ]
         n_thumbnail_names = len(thumbnail_names)
         thumbnails.extend({
@@ -3468,6 +3565,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             subtitles, automatic_captions = {}, {}
             for lang_code, caption_track in captions.items():
                 base_url = caption_track.get('baseUrl')
+                orig_lang = parse_qs(base_url).get('lang', [None])[-1]
                 if not base_url:
                     continue
                 lang_name = self._get_text(caption_track, 'name', max_runs=1)
@@ -3481,19 +3579,20 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 for trans_code, trans_name in translation_languages.items():
                     if not trans_code:
                         continue
+                    orig_trans_code = trans_code
                     if caption_track.get('kind') != 'asr':
+                        if 'translated_subs' in self._configuration_arg('skip'):
+                            continue
                         trans_code += f'-{lang_code}'
                         trans_name += format_field(lang_name, template=' from %s')
                     # Add an "-orig" label to the original language so that it can be distinguished.
                     # The subs are returned without "-orig" as well for compatibility
-                    if lang_code == f'a-{trans_code}':
+                    if lang_code == f'a-{orig_trans_code}':
                         process_language(
                             automatic_captions, base_url, f'{trans_code}-orig', f'{trans_name} (Original)', {})
                     # Setting tlang=lang returns damaged subtitles.
-                    # Not using lang_code == f'a-{trans_code}' here for future-proofing
-                    orig_lang = parse_qs(base_url).get('lang', [None])[-1]
                     process_language(automatic_captions, base_url, trans_code, trans_name,
-                                     {} if orig_lang == trans_code else {'tlang': trans_code})
+                                     {} if orig_lang == orig_trans_code else {'tlang': trans_code})
             info['automatic_captions'] = automatic_captions
             info['subtitles'] = subtitles
 
@@ -3538,17 +3637,17 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                 headers=self.generate_api_headers(ytcfg=master_ytcfg),
                 note='Downloading initial data API JSON')
 
-        try:
-            # This will error if there is no livechat
+        try:  # This will error if there is no livechat
             initial_data['contents']['twoColumnWatchNextResults']['conversationBar']['liveChatRenderer']['continuations'][0]['reloadContinuationData']['continuation']
+        except (KeyError, IndexError, TypeError):
+            pass
+        else:
             info.setdefault('subtitles', {})['live_chat'] = [{
-                'url': 'https://www.youtube.com/watch?v=%s' % video_id,  # url is needed to set cookies
+                'url': f'https://www.youtube.com/watch?v={video_id}',  # url is needed to set cookies
                 'video_id': video_id,
                 'ext': 'json',
                 'protocol': 'youtube_live_chat' if is_live or is_upcoming else 'youtube_live_chat_replay',
             }]
-        except (KeyError, IndexError, TypeError):
-            pass
 
         if initial_data:
             info['chapters'] = (
@@ -3570,7 +3669,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                         lambda x: x['superTitleIcon']['iconType']) == 'LOCATION_PIN':
                     info['location'] = stl
                 else:
-                    mobj = re.search(r'(.+?)\s*S(\d+)\s*•\s*E(\d+)', stl)
+                    mobj = re.search(r'(.+?)\s*S(\d+)\s*•?\s*E(\d+)', stl)
                     if mobj:
                         info.update({
                             'series': mobj.group(1),
@@ -3648,7 +3747,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             unified_strdate(get_first(microformats, 'uploadDate'))
             or unified_strdate(search_meta('uploadDate')))
         if not upload_date or (not info.get('is_live') and not info.get('was_live') and info.get('live_status') != 'is_upcoming'):
-            upload_date = strftime_or_none(self._extract_time_text(vpir, 'dateText')[0], '%Y%m%d')
+            upload_date = strftime_or_none(self._extract_time_text(vpir, 'dateText')[0], '%Y%m%d') or upload_date
         info['upload_date'] = upload_date
 
         for to, frm in fallbacks.items():
@@ -3734,7 +3833,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
     def _extract_basic_item_renderer(item):
         # Modified from _extract_grid_item_renderer
         known_basic_renderers = (
-            'playlistRenderer', 'videoRenderer', 'channelRenderer', 'showRenderer'
+            'playlistRenderer', 'videoRenderer', 'channelRenderer', 'showRenderer', 'reelItemRenderer'
         )
         for key, renderer in item.items():
             if not isinstance(renderer, dict):
@@ -3811,8 +3910,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             # TODO: add support for nested playlists so each shelf is processed
             # as separate playlist
             # TODO: this includes only first N items
-            for entry in self._grid_entries(renderer):
-                yield entry
+            yield from self._grid_entries(renderer)
         renderer = content.get('horizontalListRenderer')
         if renderer:
             # TODO
@@ -3832,8 +3930,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             title = self._get_text(shelf_renderer, 'title')
             yield self.url_result(shelf_url, video_title=title)
         # Shelf may not contain shelf URL, fallback to extraction from content
-        for entry in self._shelf_entries_from_content(shelf_renderer):
-            yield entry
+        yield from self._shelf_entries_from_content(shelf_renderer)
 
     def _playlist_entries(self, video_list_renderer):
         for content in video_list_renderer['contents']:
@@ -3859,6 +3956,13 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
         video_id = video_renderer.get('videoId')
         if video_id:
             return self._extract_video(video_renderer)
+
+    def _hashtag_tile_entry(self, hashtag_tile_renderer):
+        url = urljoin('https://youtube.com', traverse_obj(
+            hashtag_tile_renderer, ('onTapCommand', 'commandMetadata', 'webCommandMetadata', 'url')))
+        if url:
+            return self.url_result(
+                url, ie=YoutubeTabIE.ie_key(), title=self._get_text(hashtag_tile_renderer, 'hashtag'))
 
     def _post_thread_entries(self, post_thread_renderer):
         post_renderer = try_get(
@@ -3904,8 +4008,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             renderer = content.get('backstagePostThreadRenderer')
             if not isinstance(renderer, dict):
                 continue
-            for entry in self._post_thread_entries(renderer):
-                yield entry
+            yield from self._post_thread_entries(renderer)
 
     r''' # unused
     def _rich_grid_entries(self, contents):
@@ -3942,12 +4045,14 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                 known_renderers = {
                     'playlistVideoListRenderer': self._playlist_entries,
                     'gridRenderer': self._grid_entries,
-                    'shelfRenderer': lambda x: self._shelf_entries(x),
+                    'reelShelfRenderer': self._grid_entries,
+                    'shelfRenderer': self._shelf_entries,
                     'musicResponsiveListItemRenderer': lambda x: [self._music_reponsive_list_entry(x)],
                     'backstagePostThreadRenderer': self._post_thread_entries,
                     'videoRenderer': lambda x: [self._video_entry(x)],
                     'playlistRenderer': lambda x: self._grid_entries({'items': [{'playlistRenderer': x}]}),
                     'channelRenderer': lambda x: self._grid_entries({'items': [{'channelRenderer': x}]}),
+                    'hashtagTileRenderer': lambda x: [self._hashtag_tile_entry(x)]
                 }
                 for key, renderer in isr_content.items():
                     if key not in known_renderers:
@@ -3973,8 +4078,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
         parent_renderer = (
             try_get(tab_content, lambda x: x['sectionListRenderer'], dict)
             or try_get(tab_content, lambda x: x['richGridRenderer'], dict) or {})
-        for entry in extract_entries(parent_renderer):
-            yield entry
+        yield from extract_entries(parent_renderer)
         continuation = continuation_list[0]
 
         for page_num in itertools.count(1):
@@ -3983,7 +4087,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             headers = self.generate_api_headers(
                 ytcfg=ytcfg, account_syncid=account_syncid, visitor_data=visitor_data)
             response = self._extract_response(
-                item_id='%s page %s' % (item_id, page_num),
+                item_id=f'{item_id} page {page_num}',
                 query=continuation, headers=headers, ytcfg=ytcfg,
                 check_get_keys=('continuationContents', 'onResponseReceivedActions', 'onResponseReceivedEndpoints'))
 
@@ -4007,8 +4111,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                     continue
                 continuation_renderer = value
                 continuation_list = [None]
-                for entry in known_continuation_renderers[key](continuation_renderer):
-                    yield entry
+                yield from known_continuation_renderers[key](continuation_renderer)
                 continuation = continuation_list[0] or self._extract_continuation(continuation_renderer)
                 break
             if continuation_renderer:
@@ -4034,8 +4137,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                     continue
                 video_items_renderer = {known_renderers[key][1]: continuation_items}
                 continuation_list = [None]
-                for entry in known_renderers[key][0](video_items_renderer):
-                    yield entry
+                yield from known_renderers[key][0](video_items_renderer)
                 continuation = continuation_list[0] or self._extract_continuation(video_items_renderer)
                 break
             if video_items_renderer:
@@ -4052,14 +4154,15 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             if fatal:
                 raise ExtractorError('Unable to find selected tab')
 
-    @classmethod
-    def _extract_uploader(cls, data):
+    def _extract_uploader(self, data):
         uploader = {}
-        renderer = cls._extract_sidebar_info_renderer(data, 'playlistSidebarSecondaryInfoRenderer') or {}
+        renderer = self._extract_sidebar_info_renderer(data, 'playlistSidebarSecondaryInfoRenderer') or {}
         owner = try_get(
             renderer, lambda x: x['videoOwner']['videoOwnerRenderer']['title']['runs'][0], dict)
         if owner:
-            uploader['uploader'] = owner.get('text')
+            owner_text = owner.get('text')
+            uploader['uploader'] = self._search_regex(
+                r'^by (.+) and \d+ others?$', owner_text, 'uploader', default=owner_text)
             uploader['uploader_id'] = try_get(
                 owner, lambda x: x['navigationEndpoint']['browseEndpoint']['browseId'], compat_str)
             uploader['uploader_url'] = urljoin(
@@ -4119,7 +4222,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                 })
 
         primary_thumbnails = self._extract_thumbnails(
-            primary_sidebar_renderer, ('thumbnailRenderer', 'playlistVideoThumbnailRenderer', 'thumbnail'))
+            primary_sidebar_renderer, ('thumbnailRenderer', ('playlistVideoThumbnailRenderer', 'playlistCustomThumbnailRenderer'), 'thumbnail'))
 
         if playlist_id is None:
             playlist_id = item_id
@@ -4159,7 +4262,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                 self._extract_visitor_data(data, ytcfg)),
             **metadata)
 
-    def _extract_mix_playlist(self, playlist, playlist_id, data, ytcfg):
+    def _extract_inline_playlist(self, playlist, playlist_id, data, ytcfg):
         first_id = last_id = response = None
         for page_num in itertools.count(1):
             videos = list(self._playlist_entries(playlist))
@@ -4169,9 +4272,6 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             if start >= len(videos):
                 return
             for video in videos[start:]:
-                if video['id'] == first_id:
-                    self.to_screen('First video %s found again; Assuming end of Mix' % first_id)
-                    return
                 yield video
             first_id = first_id or videos[0]['id']
             last_id = videos[-1]['id']
@@ -4203,13 +4303,18 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
         playlist_url = urljoin(url, try_get(
             playlist, lambda x: x['endpoint']['commandMetadata']['webCommandMetadata']['url'],
             compat_str))
-        if playlist_url and playlist_url != url:
+
+        # Some playlists are unviewable but YouTube still provides a link to the (broken) playlist page [1]
+        # [1] MLCT, RLTDwFCb4jeqaKWnciAYM-ZVHg
+        is_known_unviewable = re.fullmatch(r'MLCT|RLTD[\w-]{22}', playlist_id)
+
+        if playlist_url and playlist_url != url and not is_known_unviewable:
             return self.url_result(
                 playlist_url, ie=YoutubeTabIE.ie_key(), video_id=playlist_id,
                 video_title=title)
 
         return self.playlist_result(
-            self._extract_mix_playlist(playlist, playlist_id, data, ytcfg),
+            self._extract_inline_playlist(playlist, playlist_id, data, ytcfg),
             playlist_id=playlist_id, playlist_title=title)
 
     def _extract_availability(self, data):
@@ -4289,6 +4394,10 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             check_get_keys='contents', fatal=False, ytcfg=ytcfg,
             note='Downloading API JSON with unavailable videos')
 
+    @property
+    def skip_webpage(self):
+        return 'webpage' in self._configuration_arg('skip', ie_key=YoutubeTabIE.ie_key())
+
     def _extract_webpage(self, url, item_id, fatal=True):
         retries = self.get_param('extractor_retries', 3)
         count = -1
@@ -4335,9 +4444,21 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
 
         return webpage, data
 
+    def _report_playlist_authcheck(self, ytcfg, fatal=True):
+        """Use if failed to extract ytcfg (and data) from initial webpage"""
+        if not ytcfg and self.is_authenticated:
+            msg = 'Playlists that require authentication may not extract correctly without a successful webpage download'
+            if 'authcheck' not in self._configuration_arg('skip', ie_key=YoutubeTabIE.ie_key()) and fatal:
+                raise ExtractorError(
+                    f'{msg}. If you are not downloading private content, or '
+                    'your cookies are only for the first account and channel,'
+                    ' pass "--extractor-args youtubetab:skip=authcheck" to skip this check',
+                    expected=True)
+            self.report_warning(msg, only_once=True)
+
     def _extract_data(self, url, item_id, ytcfg=None, fatal=True, webpage_fatal=False, default_client='web'):
         data = None
-        if 'webpage' not in self._configuration_arg('skip'):
+        if not self.skip_webpage:
             webpage, data = self._extract_webpage(url, item_id, fatal=webpage_fatal)
             ytcfg = ytcfg or self.extract_ytcfg(item_id, webpage)
             # Reject webpage data if redirected to home page without explicitly requesting
@@ -4351,14 +4472,7 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
                     raise ExtractorError(msg, expected=True)
                 self.report_warning(msg, only_once=True)
         if not data:
-            if not ytcfg and self.is_authenticated:
-                msg = 'Playlists that require authentication may not extract correctly without a successful webpage download.'
-                if 'authcheck' not in self._configuration_arg('skip') and fatal:
-                    raise ExtractorError(
-                        msg + ' If you are not downloading private content, or your cookies are only for the first account and channel,'
-                              ' pass "--extractor-args youtubetab:skip=authcheck" to skip this check',
-                        expected=True)
-                self.report_warning(msg, only_once=True)
+            self._report_playlist_authcheck(ytcfg, fatal=fatal)
             data = self._extract_tab_endpoint(url, item_id, ytcfg, fatal=fatal, default_client=default_client)
         return data, ytcfg
 
@@ -4396,14 +4510,20 @@ class YoutubeTabBaseInfoExtractor(YoutubeBaseInfoExtractor):
             ('contents', 'tabbedSearchResultsRenderer', 'tabs', 0, 'tabRenderer', 'content', 'sectionListRenderer', 'contents'),
             ('continuationContents', ),
         )
-        check_get_keys = tuple(set(keys[0] for keys in content_keys))
+        display_id = f'query "{query}"'
+        check_get_keys = tuple({keys[0] for keys in content_keys})
+        ytcfg = self._download_ytcfg(default_client, display_id) if not self.skip_webpage else {}
+        self._report_playlist_authcheck(ytcfg, fatal=False)
 
         continuation_list = [None]
+        search = None
         for page_num in itertools.count(1):
             data.update(continuation_list[0] or {})
+            headers = self.generate_api_headers(
+                ytcfg=ytcfg, visitor_data=self._extract_visitor_data(search), default_client=default_client)
             search = self._extract_response(
-                item_id='query "%s" page %s' % (query, page_num), ep='search', query=data,
-                default_client=default_client, check_get_keys=check_get_keys)
+                item_id=f'{display_id} page {page_num}', ep='search', query=data,
+                default_client=default_client, check_get_keys=check_get_keys, ytcfg=ytcfg, headers=headers)
             slr_contents = traverse_obj(search, *content_keys)
             yield from self._extract_entries({'contents': list(variadic(slr_contents))}, continuation_list)
             if not continuation_list[0]:
@@ -5079,12 +5199,29 @@ class YoutubeTabIE(YoutubeTabBaseInfoExtractor):
         'note': 'non-standard redirect to regional channel',
         'url': 'https://www.youtube.com/channel/UCwVVpHQ2Cs9iGJfpdFngePQ',
         'only_matching': True
+    }, {
+        'note': 'collaborative playlist (uploader name in the form "by <uploader> and x other(s)")',
+        'url': 'https://www.youtube.com/playlist?list=PLx-_-Kk4c89oOHEDQAojOXzEzemXxoqx6',
+        'info_dict': {
+            'id': 'PLx-_-Kk4c89oOHEDQAojOXzEzemXxoqx6',
+            'modified_date': '20220407',
+            'channel_url': 'https://www.youtube.com/channel/UCKcqXmCcyqnhgpA5P0oHH_Q',
+            'tags': [],
+            'uploader_id': 'UCKcqXmCcyqnhgpA5P0oHH_Q',
+            'uploader': 'pukkandan',
+            'availability': 'unlisted',
+            'channel_id': 'UCKcqXmCcyqnhgpA5P0oHH_Q',
+            'channel': 'pukkandan',
+            'description': 'Test for collaborative playlist',
+            'title': 'yt-dlp test - collaborative playlist',
+            'uploader_url': 'https://www.youtube.com/channel/UCKcqXmCcyqnhgpA5P0oHH_Q',
+        },
+        'playlist_mincount': 2
     }]
 
     @classmethod
     def suitable(cls, url):
-        return False if YoutubeIE.suitable(url) else super(
-            YoutubeTabIE, cls).suitable(url)
+        return False if YoutubeIE.suitable(url) else super().suitable(url)
 
     _URL_RE = re.compile(rf'(?P<pre>{_VALID_URL})(?(not_channel)|(?P<tab>/\w+))?(?P<post>.*)$')
 
@@ -5131,7 +5268,7 @@ class YoutubeTabIE(YoutubeTabBaseInfoExtractor):
 
         # Handle both video/playlist URLs
         qs = parse_qs(url)
-        video_id, playlist_id = [qs.get(key, [None])[0] for key in ('v', 'list')]
+        video_id, playlist_id = (qs.get(key, [None])[0] for key in ('v', 'list'))
 
         if not video_id and mobj['not_channel'].startswith('watch'):
             if not playlist_id:
@@ -5317,7 +5454,7 @@ class YoutubePlaylistIE(InfoExtractor):
         qs = parse_qs(url)
         if qs.get('v', [None])[0]:
             return False
-        return super(YoutubePlaylistIE, cls).suitable(url)
+        return super().suitable(url)
 
     def _real_extract(self, url):
         playlist_id = self._match_id(url)
@@ -5429,6 +5566,95 @@ class YoutubeFavouritesIE(YoutubeBaseInfoExtractor):
             ie=YoutubeTabIE.ie_key())
 
 
+class YoutubeNotificationsIE(YoutubeTabBaseInfoExtractor):
+    IE_NAME = 'youtube:notif'
+    IE_DESC = 'YouTube notifications; ":ytnotif" keyword (requires cookies)'
+    _VALID_URL = r':ytnotif(?:ication)?s?'
+    _LOGIN_REQUIRED = True
+    _TESTS = [{
+        'url': ':ytnotif',
+        'only_matching': True,
+    }, {
+        'url': ':ytnotifications',
+        'only_matching': True,
+    }]
+
+    def _extract_notification_menu(self, response, continuation_list):
+        notification_list = traverse_obj(
+            response,
+            ('actions', 0, 'openPopupAction', 'popup', 'multiPageMenuRenderer', 'sections', 0, 'multiPageMenuNotificationSectionRenderer', 'items'),
+            ('actions', 0, 'appendContinuationItemsAction', 'continuationItems'),
+            expected_type=list) or []
+        continuation_list[0] = None
+        for item in notification_list:
+            entry = self._extract_notification_renderer(item.get('notificationRenderer'))
+            if entry:
+                yield entry
+            continuation = item.get('continuationItemRenderer')
+            if continuation:
+                continuation_list[0] = continuation
+
+    def _extract_notification_renderer(self, notification):
+        video_id = traverse_obj(
+            notification, ('navigationEndpoint', 'watchEndpoint', 'videoId'), expected_type=str)
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        channel_id = None
+        if not video_id:
+            browse_ep = traverse_obj(
+                notification, ('navigationEndpoint', 'browseEndpoint'), expected_type=dict)
+            channel_id = traverse_obj(browse_ep, 'browseId', expected_type=str)
+            post_id = self._search_regex(
+                r'/post/(.+)', traverse_obj(browse_ep, 'canonicalBaseUrl', expected_type=str),
+                'post id', default=None)
+            if not channel_id or not post_id:
+                return
+            # The direct /post url redirects to this in the browser
+            url = f'https://www.youtube.com/channel/{channel_id}/community?lb={post_id}'
+
+        channel = traverse_obj(
+            notification, ('contextualMenu', 'menuRenderer', 'items', 1, 'menuServiceItemRenderer', 'text', 'runs', 1, 'text'),
+            expected_type=str)
+        title = self._search_regex(
+            rf'{re.escape(channel)} [^:]+: (.+)', self._get_text(notification, 'shortMessage'),
+            'video title', default=None)
+        if title:
+            title = title.replace('\xad', '')  # remove soft hyphens
+        upload_date = (strftime_or_none(self._extract_time_text(notification, 'sentTimeText')[0], '%Y%m%d')
+                       if self._configuration_arg('approximate_date', ie_key=YoutubeTabIE.ie_key())
+                       else None)
+        return {
+            '_type': 'url',
+            'url': url,
+            'ie_key': (YoutubeIE if video_id else YoutubeTabIE).ie_key(),
+            'video_id': video_id,
+            'title': title,
+            'channel_id': channel_id,
+            'channel': channel,
+            'thumbnails': self._extract_thumbnails(notification, 'videoThumbnail'),
+            'upload_date': upload_date,
+        }
+
+    def _notification_menu_entries(self, ytcfg):
+        continuation_list = [None]
+        response = None
+        for page in itertools.count(1):
+            ctoken = traverse_obj(
+                continuation_list, (0, 'continuationEndpoint', 'getNotificationMenuEndpoint', 'ctoken'), expected_type=str)
+            response = self._extract_response(
+                item_id=f'page {page}', query={'ctoken': ctoken} if ctoken else {}, ytcfg=ytcfg,
+                ep='notification/get_notification_menu', check_get_keys='actions',
+                headers=self.generate_api_headers(ytcfg=ytcfg, visitor_data=self._extract_visitor_data(response)))
+            yield from self._extract_notification_menu(response, continuation_list)
+            if not continuation_list[0]:
+                break
+
+    def _real_extract(self, url):
+        display_id = 'notifications'
+        ytcfg = self._download_ytcfg('web', display_id) if not self.skip_webpage else {}
+        self._report_playlist_authcheck(ytcfg)
+        return self.playlist_result(self._notification_menu_entries(ytcfg), display_id, display_id)
+
+
 class YoutubeSearchIE(YoutubeTabBaseInfoExtractor, SearchInfoExtractor):
     IE_DESC = 'YouTube search'
     IE_NAME = 'youtube:search'
@@ -5477,7 +5703,17 @@ class YoutubeSearchURLIE(YoutubeTabBaseInfoExtractor):
             'id': 'python',
             'title': 'python',
         }
-
+    }, {
+        'url': 'https://www.youtube.com/results?search_query=%23cats',
+        'playlist_mincount': 1,
+        'info_dict': {
+            'id': '#cats',
+            'title': '#cats',
+            'entries': [{
+                'url': r're:https://(www\.)?youtube\.com/hashtag/cats',
+                'title': '#cats',
+            }],
+        },
     }, {
         'url': 'https://www.youtube.com/results?q=test&sp=EgQIBBgB',
         'only_matching': True,
@@ -5548,7 +5784,9 @@ class YoutubeFeedsInfoExtractor(InfoExtractor):
     Subclasses must define the _FEED_NAME property.
     """
     _LOGIN_REQUIRED = True
-    _TESTS = []
+
+    def _real_initialize(self):
+        YoutubeBaseInfoExtractor._check_login_required(self)
 
     @property
     def IE_NAME(self):
@@ -5611,6 +5849,22 @@ class YoutubeHistoryIE(YoutubeFeedsInfoExtractor):
         'url': ':ythistory',
         'only_matching': True,
     }]
+
+
+class YoutubeStoriesIE(InfoExtractor):
+    IE_DESC = 'YouTube channel stories; "ytstories:" prefix'
+    IE_NAME = 'youtube:stories'
+    _VALID_URL = r'ytstories:UC(?P<id>[A-Za-z0-9_-]{21}[AQgw])$'
+    _TESTS = [{
+        'url': 'ytstories:UCwFCb4jeqaKWnciAYM-ZVHg',
+        'only_matching': True,
+    }]
+
+    def _real_extract(self, url):
+        playlist_id = f'RLTD{self._match_id(url)}'
+        return self.url_result(
+            f'https://www.youtube.com/playlist?list={playlist_id}&playnext=1',
+            ie=YoutubeTabIE, video_id=playlist_id)
 
 
 class YoutubeTruncatedURLIE(InfoExtractor):
@@ -5685,5 +5939,5 @@ class YoutubeTruncatedIDIE(InfoExtractor):
     def _real_extract(self, url):
         video_id = self._match_id(url)
         raise ExtractorError(
-            'Incomplete YouTube ID %s. URL %s looks truncated.' % (video_id, url),
+            f'Incomplete YouTube ID {video_id}. URL {url} looks truncated.',
             expected=True)

@@ -1,24 +1,23 @@
+import contextlib
 import os
 
 from ..utils import load_plugins
 
 _LAZY_LOADER = False
 if not os.environ.get('YTDLP_NO_LAZY_EXTRACTORS'):
-    try:
-        from .lazy_extractors import *
+    with contextlib.suppress(ImportError):
+        from .lazy_extractors import *  # noqa: F403
         from .lazy_extractors import _ALL_CLASSES
         _LAZY_LOADER = True
-    except ImportError:
-        pass
 
 if not _LAZY_LOADER:
-    from .extractors import *
-    _ALL_CLASSES = [
+    from .extractors import *  # noqa: F403
+    _ALL_CLASSES = [  # noqa: F811
         klass
         for name, klass in globals().items()
         if name.endswith('IE') and name != 'GenericIE'
     ]
-    _ALL_CLASSES.append(GenericIE)
+    _ALL_CLASSES.append(GenericIE)  # noqa: F405
 
 _PLUGIN_CLASSES = load_plugins('extractor', 'IE', globals())
 _ALL_CLASSES = list(_PLUGIN_CLASSES.values()) + _ALL_CLASSES
@@ -39,14 +38,10 @@ def gen_extractors():
 
 
 def list_extractors(age_limit):
-    """
-    Return a list of extractors that are suitable for the given age,
-    sorted by extractor ID.
-    """
-
-    return sorted(
-        filter(lambda ie: ie.is_suitable(age_limit), gen_extractors()),
-        key=lambda ie: ie.IE_NAME.lower())
+    """Return a list of extractors that are suitable for the given age, sorted by extractor name"""
+    return sorted(filter(
+        lambda ie: ie.is_suitable(age_limit),
+        gen_extractors()), key=lambda ie: ie.IE_NAME.lower())
 
 
 def get_info_extractor(ie_name):

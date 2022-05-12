@@ -1,5 +1,3 @@
-# coding: utf-8
-from __future__ import unicode_literals
 import hashlib
 import hmac
 import json
@@ -261,7 +259,7 @@ class VikiIE(VikiBaseIE):
         mpd_content = self._download_webpage(mpd_url, video_id, note='Downloading initial MPD manifest')
         mpd_url = self._search_regex(
             r'(?mi)<BaseURL>(http.+.mpd)', mpd_content, 'new manifest', default=mpd_url)
-        if 'mpdhd_high' not in mpd_url:
+        if 'mpdhd_high' not in mpd_url and 'sig=' not in mpd_url:
             # Modify the URL to get 1080p
             mpd_url = mpd_url.replace('mpdhd', 'mpdhd_high')
         formats = self._extract_mpd_formats(mpd_url, video_id)

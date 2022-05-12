@@ -3,17 +3,9 @@ import heapq
 import os
 
 from .common import PostProcessor
-from .ffmpeg import (
-    FFmpegPostProcessor,
-    FFmpegSubtitlesConvertorPP
-)
+from .ffmpeg import FFmpegPostProcessor, FFmpegSubtitlesConvertorPP
 from .sponsorblock import SponsorBlockPP
-from ..utils import (
-    orderedSet,
-    PostProcessingError,
-    prepend_extension,
-)
-
+from ..utils import PostProcessingError, orderedSet, prepend_extension
 
 _TINY_CHAPTER_DURATION = 1
 DEFAULT_SPONSORBLOCK_CHAPTER_TITLE = '[SponsorBlock]: %(category_names)l'
@@ -322,7 +314,7 @@ class ModifyChaptersPP(FFmpegPostProcessor):
         self.to_screen(f'Removing chapters from {filename}')
         self.concat_files([in_file] * len(concat_opts), out_file, concat_opts)
         if in_file != filename:
-            os.remove(in_file)
+            self._delete_downloaded_files(in_file, msg=None)
         return out_file
 
     @staticmethod

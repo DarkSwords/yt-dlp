@@ -1,6 +1,4 @@
-# coding: utf-8
-from __future__ import unicode_literals
-
+import xml.etree.ElementTree
 import functools
 import itertools
 import json
@@ -8,7 +6,6 @@ import re
 
 from .common import InfoExtractor
 from ..compat import (
-    compat_etree_Element,
     compat_HTTPError,
     compat_str,
     compat_urllib_error,
@@ -318,7 +315,7 @@ class BBCCoUkIE(InfoExtractor):
                 continue
             captions = self._download_xml(
                 cc_url, programme_id, 'Downloading captions', fatal=False)
-            if not isinstance(captions, compat_etree_Element):
+            if not isinstance(captions, xml.etree.ElementTree.Element):
                 continue
             subtitles['en'] = [
                 {
@@ -906,9 +903,8 @@ class BBCIE(BBCCoUkIE):
 
         playlist_title = json_ld_info.get('title')
         if not playlist_title:
-            playlist_title = self._og_search_title(
-                webpage, default=None) or self._html_search_regex(
-                r'<title>(.+?)</title>', webpage, 'playlist title', default=None)
+            playlist_title = (self._og_search_title(webpage, default=None)
+                              or self._html_extract_title(webpage, 'playlist title', default=None))
             if playlist_title:
                 playlist_title = re.sub(r'(.+)\s*-\s*BBC.*?$', r'\1', playlist_title).strip()
 

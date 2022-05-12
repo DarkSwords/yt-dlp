@@ -1,6 +1,3 @@
-# coding: utf-8
-from __future__ import unicode_literals
-
 import datetime
 import functools
 import itertools
@@ -10,8 +7,6 @@ import time
 
 from .common import InfoExtractor, SearchInfoExtractor
 from ..compat import (
-    compat_parse_qs,
-    compat_urllib_parse_urlparse,
     compat_HTTPError,
 )
 from ..utils import (
@@ -25,13 +20,17 @@ from ..utils import (
     parse_duration,
     parse_filesize,
     parse_iso8601,
+    parse_resolution,
+    qualities,
     remove_start,
+    str_or_none,
     traverse_obj,
     try_get,
     unescapeHTML,
     update_url_query,
     url_or_none,
     urlencode_postdata,
+    urljoin,
 )
 
 
@@ -192,7 +191,7 @@ class NiconicoIE(InfoExtractor):
         self._request_webpage(
             'https://account.nicovideo.jp/login', None,
             note='Acquiring Login session')
-        urlh = self._request_webpage(
+        page = self._download_webpage(
             'https://account.nicovideo.jp/login/redirector?show_button_twitter=1&site=niconico&show_button_facebook=1', None,
             note='Logging in', errnote='Unable to log in',
             data=urlencode_postdata(login_form_strs),
@@ -200,19 +199,32 @@ class NiconicoIE(InfoExtractor):
                 'Referer': 'https://account.nicovideo.jp/login',
                 'Content-Type': 'application/x-www-form-urlencoded',
             })
-        if urlh is False:
-            login_ok = False
-        else:
-            parts = compat_urllib_parse_urlparse(urlh.geturl())
-            if compat_parse_qs(parts.query).get('message', [None])[0] == 'cant_login':
-                login_ok = False
+        if 'oneTimePw' in page:
+            post_url = self._search_regex(
+                r'<form[^>]+action=(["\'])(?P<url>.+?)\1', page, 'post url', group='url')
+            page = self._download_webpage(
+                urljoin('https://account.nicovideo.jp', post_url), None,
+                note='Performing MFA', errnote='Unable to complete MFA',
+                data=urlencode_postdata({
+                    'otp': self._get_tfa_info('6 digits code')
+                }), headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                })
+            if 'oneTimePw' in page or 'formError' in page:
+                err_msg = self._html_search_regex(
+                    r'formError["\']+>(.*?)</div>', page, 'form_error',
+                    default='There\'s an error but the message can\'t be parsed.',
+                    flags=re.DOTALL)
+                self.report_warning(f'Unable to log in: MFA challenge failed, "{err_msg}"')
+                return False
+        login_ok = 'class="notice error"' not in page
         if not login_ok:
-            self.report_warning('unable to log in: bad username or password')
+            self.report_warning('Unable to log in: bad username or password')
         return login_ok
 
     def _get_heartbeat_info(self, info_dict):
         video_id, video_src_id, audio_src_id = info_dict['url'].split(':')[1].split('/')
-        dmc_protocol = info_dict['_expected_protocol']
+        dmc_protocol = info_dict['expected_protocol']
 
         api_data = (
             info_dict.get('_api_data')
@@ -366,7 +378,7 @@ class NiconicoIE(InfoExtractor):
             'width': traverse_obj(video_quality, ('metadata', 'resolution', 'width')),
             'quality': -2 if 'low' in video_quality['id'] else None,
             'protocol': 'niconico_dmc',
-            '_expected_protocol': dmc_protocol,
+            'expected_protocol': dmc_protocol,  # XXX: This is not a documented field
             'http_headers': {
                 'Origin': 'https://www.nicovideo.jp',
                 'Referer': 'https://www.nicovideo.jp/watch/' + video_id,
@@ -430,18 +442,25 @@ class NiconicoIE(InfoExtractor):
             # find in json (logged in)
             tags = traverse_obj(api_data, ('tag', 'items', ..., 'name'))
 
+        thumb_prefs = qualities(['url', 'middleUrl', 'largeUrl', 'player', 'ogp'])
+
         return {
             'id': video_id,
             '_api_data': api_data,
             'title': get_video_info(('originalTitle', 'title')) or self._og_search_title(webpage, default=None),
             'formats': formats,
-            'thumbnail': get_video_info('thumbnail', 'url') or self._html_search_meta(
-                ('image', 'og:image'), webpage, 'thumbnail', default=None),
+            'thumbnails': [{
+                'id': key,
+                'url': url,
+                'ext': 'jpg',
+                'preference': thumb_prefs(key),
+                **parse_resolution(url, lenient=True),
+            } for key, url in (get_video_info('thumbnail') or {}).items() if url],
             'description': clean_html(get_video_info('description')),
-            'uploader': traverse_obj(api_data, ('owner', 'nickname')),
+            'uploader': traverse_obj(api_data, ('owner', 'nickname'), ('channel', 'name'), ('community', 'name')),
+            'uploader_id': str_or_none(traverse_obj(api_data, ('owner', 'id'), ('channel', 'id'), ('community', 'id'))),
             'timestamp': parse_iso8601(get_video_info('registeredAt')) or parse_iso8601(
                 self._html_search_meta('video:release_date', webpage, 'date published', default=None)),
-            'uploader_id': traverse_obj(api_data, ('owner', 'id')),
             'channel': traverse_obj(api_data, ('channel', 'name'), ('community', 'name')),
             'channel_id': traverse_obj(api_data, ('channel', 'id'), ('community', 'id')),
             'view_count': int_or_none(get_video_info('count', 'view')),
@@ -459,7 +478,7 @@ class NiconicoIE(InfoExtractor):
         comment_user_key = traverse_obj(api_data, ('comment', 'keys', 'userKey'))
         user_id_str = session_api_data.get('serviceUserId')
 
-        thread_ids = [x for x in traverse_obj(api_data, ('comment', 'threads')) or [] if x['isActive']]
+        thread_ids = traverse_obj(api_data, ('comment', 'threads', lambda _, v: v['isActive']))
         raw_danmaku = self._extract_all_comments(video_id, thread_ids, user_id_str, comment_user_key)
         if not raw_danmaku:
             self.report_warning(f'Failed to get comments. {bug_reports_message()}')
